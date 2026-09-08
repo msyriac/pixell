@@ -334,6 +334,79 @@ class Geometry:
 	def l2pix(self, ls):  return l2pix(self.shape, self.wcs, ls)
 	def pix2l(self, pix): return pix2l(self.shape, self.wcs, pix)
 
+class _wcs_aux:
+	"""Hashable holder for a wcs, so that it can travel as the static part of a
+	JAX pytree, which numpy and astropy objects cannot do themselves."""
+	__slots__ = ("wcs", "key")
+	def __init__(self, wcs):
+		self.wcs = wcs
+		w = wcs.wcs
+		self.key = (tuple(w.ctype), tuple(w.cdelt), tuple(w.crval), tuple(w.crpix))
+	def __hash__(self): return hash(self.key)
+	def __eq__(self, other):
+		return isinstance(other, _wcs_aux) and self.key == other.key
+
+_devmap_registered = [False]
+def _register_devmap():
+	"""Registers devmap as a JAX pytree, once, when the first one wraps a JAX
+	array. Then a devmap can be passed to and returned from a jitted function:
+	the pixels are the leaf, the geometry is static."""
+	if _devmap_registered[0]: return
+	try:
+		from jax.tree_util import register_pytree_node
+	except ImportError:
+		return
+	register_pytree_node(devmap, lambda m: ((m.arr,), _wcs_aux(m.wcs)),
+		lambda aux, kids: devmap(kids[0], aux.wcs))
+	_devmap_registered[0] = True
+
+class devmap:
+	"""A map whose pixels live on a device, as a CuPy or JAX array, together
+	with its world coordinate system. A numpy map carries its wcs by being an
+	ndmap; device arrays can be neither subclassed nor given attributes, so
+	they are wrapped here instead. The transforms in curvedsky take a devmap
+	wherever they take an ndmap, and give one back when the pixels are on a
+	device.
+
+	Parameters
+	----------
+	arr: the pixels, of shape [...,ny,nx], as any array that is not numpy.
+	wcs: the world coordinate system of the map.
+	"""
+	def __init__(self, arr, wcs):
+		self.arr, self.wcs = arr, wcs
+		if type(arr).__module__.split(".")[0] in ("jax", "jaxlib"): _register_devmap()
+	@property
+	def shape(self): return tuple(self.arr.shape)
+	@property
+	def dtype(self): return self.arr.dtype
+	@property
+	def ndim(self): return self.arr.ndim
+	@property
+	def geometry(self): return Geometry(self.shape, self.wcs)
+	def samewcs(self, arr):
+		"""The same geometry around other pixels"""
+		return devmap(arr, self.wcs)
+	def __len__(self): return len(self.arr)
+	def __getitem__(self, sel):
+		# the wcs is carried over unchanged, as ndmap does; use slice_geometry
+		# if a slice of the pixel axes has to change it
+		return devmap(self.arr[sel], self.wcs)
+	def __setitem__(self, sel, val):
+		self.arr[sel] = val.arr if isinstance(val, devmap) else val
+	def get(self):
+		"""The pixels on the host, as an ndmap"""
+		arr = self.arr
+		return ndmap(arr.get() if hasattr(arr, "get") else np.asarray(arr), self.wcs)
+	def __array__(self, dtype=None, copy=None):
+		# without this numpy would treat the object as a nested sequence and walk
+		# it element by element; CuPy refuses the implicit copy, as it should
+		res = np.asarray(self.get())
+		return res if dtype is None else res.astype(dtype)
+	def __repr__(self):
+		return "devmap(%s,%s,%s)" % (self.shape, self.dtype, wcsutils.describe(self.wcs))
+	def __str__(self): return repr(self)
+
 def corners(shape, wcs, npoint=10, corner=True):
 	"""Return the coordinates of the bottom left and top right corners of the
 	geometry given by shape, wcs.

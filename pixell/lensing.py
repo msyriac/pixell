@@ -441,6 +441,11 @@ def lens_map_curved(shape, wcs, phi_alm, cmb_alm, phi_ainfo=None, dtype=np.float
 		"method must be one of 'pixell' or 'lenspyx'"
 
 	if method=='pixell':
+		from . import curvedsky
+		if curvedsky.is_device_array(cmb_alm) or curvedsky.is_device_array(phi_alm):
+			return _lens_map_curved_device(shape, wcs, phi_alm, cmb_alm,
+				phi_ainfo=phi_ainfo, dtype=dtype, spin=spin, output=output,
+				geodesic=geodesic, delta_theta=delta_theta, verbose=verbose)
 		warnings.warn('In the future, the default will be switched to lenspyx')
 
 		from . import curvedsky
@@ -507,6 +512,77 @@ def lens_map_curved(shape, wcs, phi_alm, cmb_alm, phi_ainfo=None, dtype=np.float
 										dtype=dtype, spin=spin, output=output,
 										epsilon=epsilon, nthreads=nthreads, verbose=verbose)
 
+def _lens_map_curved_device(shape, wcs, phi_alm, cmb_alm, phi_ainfo=None, dtype=np.float64,
+		spin=[0,2], output="l", geodesic=True, delta_theta=None, verbose=False):
+	"""lens_map_curved for coefficients that live on a GPU, which it calls when
+	the coefficients are not numpy arrays. The steps are those of the pixell
+	method: the deflection field from phi, the displaced positions, and the CMB
+	evaluated there with alm2map_pos. Each declination band is built rather than
+	written into a preallocated map, since arrays on a device may be immutable.
+	The maps come back as enmap.devmap, so they carry their geometry."""
+	from . import curvedsky
+	xp     = curvedsky.array_module(cmb_alm)[1]
+	# the maps are in the dtype that was asked for, as on the CPU, rather than
+	# in whatever the coefficients happen to be
+	def cast(arr): return arr if arr.dtype == dtype else arr.astype(dtype)
+	oshape = shape[-3:]
+	if len(oshape) == 2: shape = (1,)+tuple(shape)
+	ncomp  = shape[-3]
+	if delta_theta is None: bsize = shape[-2]
+	else:
+		bsize = utils.nint(abs(delta_theta/utils.degree/wcs.wcs.cdelt[1]))
+		# Adjust bsize so we don't get any tiny blocks at the end
+		nblock= shape[-2]//bsize
+		bsize = int(shape[-2]/(nblock+0.5))
+	if "k" in output:
+		raise NotImplementedError("the convergence map is not available for coefficients "
+			"on a device; ask for the potential with output='p' instead")
+	bands = {c: [] for c in output}
+	for i1 in range(0, shape[-2], bsize):
+		i2 = min(i1+bsize, shape[-2])
+		lshape, lwcs = enmap.slice_geometry(shape, wcs, (slice(i1,i2),slice(None)))
+		geom = (lshape[-2:], lwcs)
+		if "p" in output:
+			if verbose: print("Computing phi map")
+			bands["p"].append(cast(curvedsky.pixels(curvedsky.alm2map(phi_alm, geom))))
+		if verbose: print("Computing grad map")
+		grad = cast(curvedsky.pixels(curvedsky.alm2map(phi_alm, geom, deriv=True)))
+		if "a" in output: bands["a"].append(grad)
+		if "u" in output:
+			if verbose: print("Computing unlensed map")
+			bands["u"].append(cast(curvedsky.pixels(curvedsky.alm2map(cmb_alm, geom, spin=spin))))
+		if "l" not in output: continue
+		if verbose: print("Computing observed coordinates")
+		# a cylindrical geometry has separable coordinates, so the two axes are
+		# built on the host and broadcast on the device
+		dec, ra = enmap.posaxes(lshape[-2:], lwcs)
+		ones = xp.ones(tuple(lshape[-2:]), np.float64)
+		ipos = xp.stack([xp.asarray(dec, np.float64)[:,None]*ones,
+			xp.asarray(ra, np.float64)[None,:]*ones])
+		if verbose: print("Computing alpha map")
+		opos = offset_by_grad(ipos, grad, geodesic=geodesic, pol=ncomp>1)
+		if verbose: print("Computing lensed map")
+		obs  = cast(curvedsky.alm2map_pos(cmb_alm, pos=opos[:2], spin=spin))
+		if obs.ndim == 2: obs = obs[None]
+		if opos.shape[0] > 2 and geodesic:
+			if verbose: print("Rotating polarization")
+			# the angle is in double precision, like the positions it comes
+			# from, so the factors are cast before they meet the map: mixing
+			# them would silently promote the whole map, which for a full sky
+			# map at 0.5 arcmin is 11 GB of device memory turning into 22
+			c = xp.cos(2*opos[2]).astype(obs.dtype)
+			s = xp.sin(2*opos[2]).astype(obs.dtype)
+			q, u = obs[-2], obs[-1]
+			obs  = xp.concatenate([obs[:-2], xp.stack([c*q-s*u, s*q+c*u])])
+		bands["l"].append(obs)
+	# Output in same order as specified in output argument
+	res = []
+	for c in output:
+		arr = bands[c][0] if len(bands[c]) == 1 else xp.concatenate(bands[c], axis=-2)
+		if c in ("l","u"): arr = arr.reshape(oshape)
+		res.append(enmap.devmap(arr, wcs))
+	return tuple(res)
+
 def rand_alm(ps_lensinput, lmax=None, dtype=np.float64, seed=None, phi_seed=None, verbose=False, ncomp=None):
 	from . import curvedsky
 	ctype   = np.result_type(dtype,0j)
@@ -557,6 +633,8 @@ def offset_by_grad(ipos, grad, geodesic=True, pol=None):
 	approximation is used, which is still very accurate unless one is
 	close to the poles."""
 	ncomp = 2 if pol is False or pol is None and ipos.shape[0] <= 2 else 3
+	if not isinstance(ipos, np.ndarray) or not isinstance(grad, np.ndarray):
+		return _offset_by_grad_device(ipos, grad, ncomp, geodesic)
 	opos = np.empty((ncomp,)+ipos.shape[1:])
 	iflat = ipos.reshape(ipos.shape[0],-1)
 	# Oflat is a flattened view of opos, so changes to oflat
@@ -588,26 +666,41 @@ def offset_by_grad(ipos, grad, geodesic=True, pol=None):
 		if oflat.shape[0] > 2: oflat[2] = 0
 	return opos
 
-def offset_by_grad_helper(ipos, grad, pol):
+def offset_by_grad_helper(ipos, grad, pol, xp=np):
 	"""Find the new position and induced rotation
 	from offseting the input positions ipos[2,nsamp]
-	by grad[2,nsamp]."""
-	grad = np.array(grad)
-	# Decompose grad into direction and length.
-	# Fix zero-length gradients first, to avoid
-	# division by zero.
-	grad[:,np.all(grad==0,0)] = 1e-20
-	d = np.sum(grad**2,0)**0.5
-	grad  /=d
+	by grad[2,nsamp]. Written without updates in place, so the same
+	trigonometry serves arrays on a device, which may be immutable."""
+	# The deflection may be single precision, while the positions are always
+	# double. cos(d) of a small single precision deflection rounds to one, which
+	# drives ocost to the ends of its range near the poles and turns the root
+	# below into a nan, so the direction is found in the precision of the
+	# positions.
+	if grad.dtype != ipos.dtype: grad = grad.astype(ipos.dtype)
+	# Decompose grad into direction and length. A deflection of zero length has
+	# no direction; it is carried through with a placeholder length and put back
+	# at the end. Nudging it to something tiny instead, as this used to, makes
+	# cos(d) round to one, so that ocost is one at a pole, osint cancels to zero
+	# and the longitude below divides by it.
+	d      = xp.sum(grad**2,0)**0.5
+	moved  = d > 0
+	grad   = grad/xp.where(moved, d, 1.)
 	# Perform the position offset using spherical
 	# trigonometry
-	cosd, sind = np.cos(d), np.sin(d)
-	cost, sint = np.cos(ipos[0]), np.sin(ipos[0])
-	ocost  = cosd*cost-sind*sint*grad[0]
+	cosd, sind = xp.cos(d), xp.sin(d)
+	cost, sint = xp.cos(ipos[0]), xp.sin(ipos[0])
+	# rounding can carry ocost a little past the ends of the cosine range
+	ocost  = xp.clip(cosd*cost-sind*sint*grad[0], -1., 1.)
 	osint  = (1-ocost**2)**0.5
-	ophi   = ipos[1] + np.arcsin(sind*grad[1]/osint)
+	# the shift in longitude is undefined where the displaced point lands on a
+	# pole, which is where osint is zero
+	with utils.nowarn():
+		sinphi = xp.where(osint>0, sind*grad[1]/xp.where(osint>0, osint, 1.), 0.)
+	ophi   = ipos[1] + xp.arcsin(xp.clip(sinphi, -1., 1.))
+	otheta = xp.where(moved, xp.arccos(ocost), ipos[0])
+	ophi   = xp.where(moved, ophi, ipos[1])
 	if not pol:
-		return np.array([np.arccos(ocost), ophi]), None
+		return xp.stack([otheta, ophi]), None
 	# Compute the induced polarization rotation.
 	with utils.nowarn():
 		# If sint is zero then we get a divide by zero here, but
@@ -617,8 +710,40 @@ def offset_by_grad_helper(ipos, grad, pol):
 	denom  = 1+A**2
 	cosgam = 2*nom1**2/denom-1
 	singam = 2*nom1*(grad[1]-grad[0]*A)/denom
-	res = np.array([np.arccos(ocost), ophi]), np.array([cosgam,singam])
-	return res
+	# a point that did not move is not rotated either
+	cosgam = xp.where(moved, cosgam, 1.)
+	singam = xp.where(moved, singam, 0.)
+	return xp.stack([otheta, ophi]), xp.stack([cosgam,singam])
+
+def _offset_by_grad_device(ipos, grad, ncomp, geodesic):
+	"""offset_by_grad for arrays that may live on a GPU. The trigonometry is
+	the same function the numpy path uses; only the bookkeeping around it is
+	written as a chain of new arrays rather than as updates in place. There is
+	no chunking, since a device band is already sized to fit."""
+	from . import curvedsky
+	xp    = curvedsky.array_module(ipos)[1]
+	shape = ipos.shape[1:]
+	iflat = ipos.reshape(ipos.shape[0],-1)
+	gflat = grad.reshape(grad.shape[0],-1)
+	if geodesic:
+		# the helper works in zenith coordinates
+		opos, orot = offset_by_grad_helper(
+			xp.stack([np.pi/2-iflat[0], iflat[1]]),
+			xp.stack([-gflat[0], gflat[1]]), ncomp>2, xp=xp)
+		out = [np.pi/2-opos[0], opos[1]]
+		if ncomp > 2:
+			rot = xp.arctan2(orot[1], orot[0])
+			if iflat.shape[0] > 2: rot = rot + iflat[2]
+			out.append(rot)
+	else:
+		dec = iflat[0] + gflat[0]
+		ra  = iflat[1] + gflat[1]/xp.cos(iflat[0])
+		hi, lo = dec > np.pi/2, dec < -np.pi/2
+		ra  = xp.where(hi|lo, ra+np.pi, ra)
+		dec = xp.where(hi, np.pi-dec, xp.where(lo, -np.pi-dec, dec))
+		out = [dec, ra]
+		if ncomp > 2: out.append(xp.zeros_like(dec))
+	return xp.stack(out).reshape((ncomp,)+shape)
 
 def pole_wrap(pos):
 	"""Handle pole wraparound."""

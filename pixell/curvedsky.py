@@ -1,7 +1,7 @@
 """This module provides functions for taking into account the curvature of the
 full sky."""
 from __future__ import print_function, division
-import numpy as np, os, warnings
+import numpy as np, os, warnings, functools
 from . import enmap, powspec, wcsutils, utils, bunch
 
 from . import cmisc
@@ -87,12 +87,15 @@ def alm2map(alm, map, spin=[0,2], deriv=False, adjoint=False,
 
 	Parameters
 	----------
-	alm: complex64 or complex128 numpy array with shape [...,ncomp,nelem],
+	alm: complex64 or complex128 array with shape [...,ncomp,nelem],
 	 [ncomp,nelem] or [nelem]. Spin transforms will be applied to the ncomp
 	 axis, controlled by the spin argument below.
 	map: float32 or float64 enmap with shape [...,ncomp,ny,nx], [ncomp,ny,nx]
 	 or [ny,nx]. All but last two dimensions must match alm.
-	 Will be overwritten unless copy is True
+	 Will be overwritten unless copy is True.
+	 May be an enmap.devmap, which is how a map on a GPU carries its geometry,
+	 or a geometry (an enmap.Geometry or a shape, wcs pair), in which case a new
+	 map is allocated and returned.
 
 	Options
 	-------
@@ -143,8 +146,18 @@ def alm2map(alm, map, spin=[0,2], deriv=False, adjoint=False,
 	Returns
 	-------
 	The resulting map. This will be the same object as the map argument,
-	or a copy if copy == True."""
+	or a copy if copy == True, or a new map if a geometry was given. A map on a
+	GPU comes back as an enmap.devmap.
+
+	Arrays on a GPU, as CuPy or JAX arrays, are transformed by ducc's CUDA
+	backend, with the same arguments as here. That path
+	only has the "cyl" method, and JAX arrays, being immutable, take a geometry
+	or a devmap as the map argument and give a new devmap back. Otherwise
+	nothing changes."""
 	if tweak: warnings.warn("The tweak argument is deprecated and does nothing after the libsharp→ducc transition. It will be removed in a future version")
+	if device_transform(alm, map):
+		return _device_alm2map(alm, map, spin=spin, deriv=deriv, adjoint=adjoint,
+			copy=copy, ainfo=ainfo, nthread=nthread, pix_tol=pix_tol, method=method)
 	minfo = analyse_geometry(map.shape, map.wcs, tol=pix_tol)
 	if method == "auto": method = get_method(map.shape, map.wcs, minfo=minfo)
 	if   method == "2d":
@@ -182,18 +195,18 @@ def alm2map_pos(alm, pos=None, loc=None, ainfo=None, map=None, spin=[0,2], deriv
 		if copy and alm is not None: alm = alm.copy()
 	else:
 		if copy and map is not None: map = map.copy()
-	if loc is None:
-		# The disadvantage of passing pos instead of loc is that we end up
-		# making a copy in the convention ducc wants
-		loc = np.moveaxis(np.asarray(pos),0,-1).copy(order="C")
-		# This should use less memory than writing loc[:,0] = np.pi/2-loc[:,0]
-		loc[...,0] *= -1
-		loc[...,0] += np.pi/2
-		# Should use rewind here, but this is more efficient
-		loc[loc[...,1]<0,1] += 2*np.pi
-		# Support arbitrary pre-dimensions for loc (post-dimensions for pos)
+	if loc is None: loc = _loc_from_pos(pos)
+	# Support arbitrary pre-dimensions for loc (post-dimensions for pos)
 	lpre = loc.shape[:-1]
 	loc  = loc.reshape(-1,2)
+	if device_transform_pos(alm, map, loc):
+		# the values are flat over the positions here, and take the shape of loc
+		# back at the end; alm2map_pos has already made the copy that copy asks for
+		fmap = map if map is None else map.reshape(map.shape[:map.ndim-len(lpre)]+(-1,))
+		res  = _device_alm2map_pos(alm, loc, map=fmap, ainfo=ainfo, spin=spin, deriv=deriv,
+			adjoint=adjoint, nthread=nthread, epsilon=epsilon)
+		if adjoint: return res
+		return res.reshape(res.shape[:-1]+lpre)
 	if deriv: oshape = alm.shape[:-1]+(2,len(loc))
 	else:     oshape = alm.shape[:-1]+(len(loc),)
 	if map is None:
@@ -280,8 +293,17 @@ def map2alm(map, alm=None, lmax=None, spin=[0,2], deriv=False, adjoint=False,
 	Returns
 	-------
 	The resulting alm. This will be the same object as the alm argument,
-	or a copy if copy == True."""
+	or a copy if copy == True, or a new array if none was given.
+
+	Arrays on a GPU, as CuPy or JAX arrays, are transformed by ducc's CUDA
+	backend, with the same arguments as here. Such a map
+	carries its geometry by being an enmap.devmap, the way a map in memory
+	carries it by being an ndmap. That path only has the "cyl" method."""
 	if tweak: warnings.warn("The tweak argument is deprecated and does nothing after the libsharp→ducc transition. It will be removed in a future version")
+	if device_transform(alm, map):
+		return _device_map2alm(map, alm, spin=spin, deriv=deriv, adjoint=adjoint,
+			copy=copy, ainfo=ainfo, lmax=lmax, weights=weights, niter=niter,
+			nthread=nthread, pix_tol=pix_tol, method=method)
 	minfo = analyse_geometry(map.shape, map.wcs, tol=pix_tol)
 	if method == "auto": method = get_method(map.shape, map.wcs, minfo=minfo)
 	if   method == "2d":
@@ -475,6 +497,39 @@ class alm_info:
 	def __repr__(self):
 		return "alm_info(lmax=%s,mmax=%s,mstart=%s)" % (str(self.lmax),str(self.mmax),str(self.mstart))
 
+def _loc_from_pos(pos):
+	"""ducc's positions [...,{colatitude,longitude}] from a pos [{dec,ra},...].
+	The disadvantage of passing pos instead of loc is that we end up making a
+	copy in the convention ducc wants."""
+	kind, xp = array_module(pos)
+	if kind != "numpy":
+		loc = xp.moveaxis(xp.asarray(pos), 0, -1)
+		return xp.stack([np.pi/2-loc[...,0], loc[...,1] % (2*np.pi)], axis=-1)
+	loc = np.moveaxis(np.asarray(pos),0,-1).copy(order="C")
+	# This should use less memory than writing loc[:,0] = np.pi/2-loc[:,0]
+	loc[...,0] *= -1
+	loc[...,0] += np.pi/2
+	# Should use rewind here, but this is more efficient
+	loc[loc[...,1]<0,1] += 2*np.pi
+	return loc
+
+def device_transform_pos(alm, map, loc):
+	"""Whether a transform at arbitrary positions has to go to the device code:
+	when any of the arrays is not a numpy array, which is how coefficients,
+	values and positions on a GPU arrive here."""
+	return any(is_device_array(arr) for arr in (alm, map, loc))
+
+def device_transform(alm, map):
+	"""Whether a transform of these arguments has to go to the device code: when the
+	map is given as a geometry, or when either array is not a numpy array, which
+	is how maps and coefficients on a GPU arrive here."""
+	if isinstance(map, enmap.Geometry) or (isinstance(map, tuple) and len(map) == 2): return True
+	for arr in (alm, map):
+		if arr is None or isinstance(arr, np.ndarray): continue
+		if hasattr(arr, "shape") and hasattr(arr, "dtype"): return True
+		if hasattr(arr, "shape") and hasattr(arr, "wcs"):   return True
+	return False
+
 def get_method(shape, wcs, minfo=None, pix_tol=1e-6):
 	"""Return which method map2alm and alm2map will use for the given
 	enmap geometry. Returns either "2d", "cyl" or "general"."""
@@ -500,7 +555,7 @@ def quad_weights(shape, wcs, pix_tol=1e-6):
 	ny      = shape[-2]+np.sum(minfo.ypad)
 	weights = ducc0.sht.experimental.get_gridweights(minfo.ducc_geo.name, ny)
 	weights = weights[minfo.ypad[0]:len(weights)-minfo.ypad[1]]
-	if minfo.flip: weights = weights[::-1]
+	if minfo.flip[0]: weights = weights[::-1]
 	weights/= minfo.ducc_geo.nx
 	return weights
 
@@ -857,7 +912,7 @@ def map2alm_cyl(map, alm=None, ainfo=None, minfo=None, lmax=None, spin=[0,2], we
 			weights/= minfo.ducc_geo.nx
 		else:
 			weights = map.pixsizemap(separable=True, broadcastable=True)[:,0]
-			if minfo.flip: weights = weights[::-1]
+			if minfo.flip[0]: weights = weights[::-1]
 		weights = weights.astype(map.dtype, copy=False)
 	# Loop over pre-pre-dimensions. ducc usually doesn't do anything clever with
 	# these, so looping in python is cheap
@@ -936,7 +991,8 @@ def alm2map_raw_cyl(alm, map, ainfo=None, minfo=None, spin=[0,2], deriv=False, c
 	if adjoint: func = ducc0.sht.experimental.adjoint_synthesis
 	else:       func = ducc0.sht.experimental.synthesis
 	kwargs   = {"theta":rinfo.theta, "nphi":rinfo.nphi, "phi0":rinfo.phi0,
-		"ringstart":rinfo.offsets, "lmax":ainfo.lmax, "mmax":ainfo.mmax,
+		"ringstart":rinfo.offsets, "pixstride":int(rinfo.stride[0]),
+		"lmax":ainfo.lmax, "mmax":ainfo.mmax,
 		"mstart": ainfo.mstart, "nthreads":nthread}
 	# Iterate over all the predimensions. Why do I do this instead of just
 	# passing them on to ducc all at once?
@@ -951,9 +1007,15 @@ def alm2map_raw_cyl(alm, map, ainfo=None, minfo=None, spin=[0,2], deriv=False, c
 	# dimensions, so this outermost loop usually does nothing
 	for I in utils.nditer(map_full.shape[:-2]):
 		if deriv:
-			func(alm=utils.fix_zero_strides(alm_full[I][None]), map=map_full[I], mode="DERIV1", spin=1, **kwargs)
-			# Flip sign of theta derivative to get dec derivative
-			map_full[I+(0,)] *= -1
+			# The dec derivative is minus the theta derivative, so the sign of the
+			# first component is flipped: on the output of a synthesis, and on the
+			# input of its adjoint, which is what keeps the two a transpose pair
+			decflip = np.array([-1,1], dtype=map_full.dtype)[:,None]
+			if adjoint:
+				func(alm=utils.fix_zero_strides(alm_full[I][None]), map=map_full[I]*decflip, mode="DERIV1", spin=1, **kwargs)
+			else:
+				func(alm=utils.fix_zero_strides(alm_full[I][None]), map=map_full[I], mode="DERIV1", spin=1, **kwargs)
+				map_full[I] *= decflip
 		else:
 			for s, j1, j2 in enmap.spin_helper(spin, alm_full.shape[-2]):
 				Ij = I+(slice(j1,j2),)
@@ -1005,9 +1067,15 @@ def alm2map_raw_general(alm, map, loc, ainfo=None, spin=[0,2], deriv=False, copy
 	# Iterate over all the predimensions.
 	for I in utils.nditer(map_full.shape[:-2]):
 		if deriv:
-			func(alm=utils.fix_zero_strides(alm_full[I][None]), map=map_full[I], mode="DERIV1", spin=1, **kwargs)
-			# Flip sign of theta derivative to get dec derivative
-			map_full[I+(0,)] *= -1
+			# The dec derivative is minus the theta derivative, so the sign of the
+			# first component is flipped: on the output of a synthesis, and on the
+			# input of its adjoint, which is what keeps the two a transpose pair
+			decflip = np.array([-1,1], dtype=map_full.dtype)[:,None]
+			if adjoint:
+				func(alm=utils.fix_zero_strides(alm_full[I][None]), map=map_full[I]*decflip, mode="DERIV1", spin=1, **kwargs)
+			else:
+				func(alm=utils.fix_zero_strides(alm_full[I][None]), map=map_full[I], mode="DERIV1", spin=1, **kwargs)
+				map_full[I] *= decflip
 		else:
 			for s, j1, j2 in enmap.spin_helper(spin, alm_full.shape[-2]):
 				Ij = I+(slice(j1,j2),)
@@ -1057,7 +1125,8 @@ def map2alm_raw_cyl(map, alm=None, ainfo=None, lmax=None, spin=[0,2], weights=No
 	map_full = utils.postflat(map_full, 2) # ducc wants just 1 pixel axis
 	rinfo    = get_ring_info   (map.shape, map.wcs)
 	kwargs   = {"theta":rinfo.theta, "nphi":rinfo.nphi, "phi0":rinfo.phi0,
-		"ringstart":rinfo.offsets, "lmax":ainfo.lmax, "mmax":ainfo.mmax,
+		"ringstart":rinfo.offsets, "pixstride":int(rinfo.stride[0]),
+		"lmax":ainfo.lmax, "mmax":ainfo.mmax,
 		"mstart": ainfo.mstart, "nthreads":nthread}
 	# Helper for weights multiplication
 	def wmul(map_flat, weights):
@@ -1169,9 +1238,18 @@ def nalm2lmax(nalm):
 
 def get_ring_info(shape, wcs, dtype=np.float64):
 	"""Return information about the horizontal rings of pixels in a cylindrical pixelization.
-	Used in map2alm and alm2map with the "cyl" method."""
+	Used in map2alm and alm2map with the "cyl" method.
+
+	The rings are described as the map is stored. A ring always runs towards
+	increasing azimuth, so for a map whose azimuth decreases with the x index
+	it starts at the last pixel of its row and has stride -1. Maps that have
+	already been flipped to increasing azimuth, as map2buffer does, get the
+	usual stride of +1."""
 	y = np.arange(shape[-2])
-	x = y*0
+	# a ring starts where its azimuth is lowest, which is the last pixel of the
+	# row if the azimuth decreases with x
+	back = wcs.wcs.cdelt[0] < 0
+	x = y*0 + (shape[-1]-1 if back else 0)
 	dec, ra = enmap.pix2sky(shape, wcs, [y,x])
 	theta   = np.asarray(np.pi/2-dec, dtype=dtype)
 	assert theta.ndim == 1, "theta must be one-dimensional!"
@@ -1186,7 +1264,8 @@ def get_ring_info(shape, wcs, dtype=np.float64):
 	if phi0.ndim == 0:
 		phi0 = np.zeros(ntheta,dtype=dtype)+phi0
 	offsets = utils.cumsum(nphi).astype(np.uint64, copy=False)
-	stride  = np.zeros(ntheta,dtype=np.int32)+1
+	if back: offsets = (offsets + nphi-1).astype(np.uint64, copy=False)
+	stride  = np.zeros(ntheta,dtype=np.int32)+(-1 if back else 1)
 	return bunch.Bunch(theta=theta, nphi=nphi, phi0=phi0, offsets=offsets, stride=stride, npix=np.sum(nphi), nrow=len(nphi))
 
 def get_ring_info_healpix(nside, rings=None):
@@ -1471,3 +1550,584 @@ def alm_real2complex(ralm, ainfo=None):
 	oalm[...,:i] = ralm[...,:i]
 	oalm[...,i:] = ralm[...,i:].view(ctype)/2**0.5
 	return oalm
+
+
+# --- ducc's ring transforms as JAX functions -------------------------------
+# These are what alm2map and map2alm use for JAX arrays. They live behind a
+# function because building them needs jax, which pixell does not depend on,
+# and because the handlers may only be registered once.
+
+def _jax_platform():
+	"""The JAX platform ducc's handlers are registered for: "CUDA", or "cpu"
+	for a build with the emulated backend."""
+	return ducc0.sht.sht_ffi_platform
+
+def _sht_ffi_attrs(spin, lmax, theta, nphi, phi0, ringstart, mstart=None, lstride=1,
+		mmax=None, mode="STANDARD", pixstride=1):
+	"""The geometry and layout of a transform, as the attributes ducc's XLA
+	handlers take. The default alm layout is the triangular one."""
+	spins = [int(spin)] if np.ndim(spin) == 0 else [int(s) for s in spin]
+	if mmax   is None: mmax   = lmax
+	if mstart is None: mstart = alm_info(lmax=lmax, mmax=mmax, stride=lstride).mstart
+	return dict(
+		spins     = np.ascontiguousarray(spins,     dtype=np.int64),
+		lmax      = int(lmax),
+		lstride   = int(lstride),
+		pixstride = int(pixstride),
+		mode      = str(mode),
+		theta     = np.ascontiguousarray(theta,     dtype=np.float64),
+		nphi      = np.ascontiguousarray(nphi,      dtype=np.int64),
+		phi0      = np.ascontiguousarray(phi0,      dtype=np.float64),
+		ringstart = np.ascontiguousarray(ringstart, dtype=np.int64),
+		mstart    = np.ascontiguousarray(mstart,    dtype=np.int64))
+
+def _sht_ffi_general_attrs(spin, lmax, mstart=None, lstride=1, mmax=None,
+		mode="STANDARD", epsilon=1e-10, sigma_min=1.1, sigma_max=2.6):
+	"""The layout and accuracy of a transform at arbitrary positions, as the
+	attributes ducc's XLA handlers take. The positions themselves are an
+	argument of the call, not an attribute."""
+	spins = [int(spin)] if np.ndim(spin) == 0 else [int(s) for s in spin]
+	if mmax   is None: mmax   = lmax
+	if mstart is None: mstart = alm_info(lmax=lmax, mmax=mmax, stride=lstride).mstart
+	return dict(
+		spins     = np.ascontiguousarray(spins, dtype=np.int64),
+		lmax      = int(lmax),
+		lstride   = int(lstride),
+		mode      = str(mode),
+		mstart    = np.ascontiguousarray(mstart, dtype=np.int64),
+		epsilon   = float(epsilon),
+		sigma_min = float(sigma_min),
+		sigma_max = float(sigma_max))
+
+def _sht_ffi_ncomp(spins, mode):
+	"""Number of map components and of alm rows the transform has. A spin 0
+	entry uses one of each, any other spin two maps, and two alm rows except in
+	the GRAD_ONLY and DERIV1 modes, which have a single one."""
+	nmap = sum(1 if s == 0 else 2 for s in spins)
+	if str(mode) == "STANDARD": return nmap, nmap
+	return 2, 1
+
+def _sht_ffi_npix(attrs):
+	"""Pixels per component of the map the attributes describe: one past the
+	last index any ring reaches."""
+	rs, nph, ps = attrs["ringstart"], attrs["nphi"], attrs["pixstride"]
+	return int(np.max(rs + (nph-1)*ps if ps > 0 else rs)) + 1
+
+def _sht_ffi_nelem(attrs):
+	"""Coefficients per row the attributes describe"""
+	return int(attrs["mstart"][-1] + attrs["lmax"]*attrs["lstride"] + 1)
+
+class _ShtKey:
+	"""Hashable wrapper for the attributes, which hold arrays and are passed as
+	a static argument of the differentiable transforms."""
+	def __init__(self, attrs): self.attrs = attrs
+	def __hash__(self): return id(self)
+	def __eq__(self, other): return self is other
+
+@functools.lru_cache(maxsize=None)
+def _jax_sht():
+	"""ducc's ring based synthesis and adjoint synthesis as JAX functions, with
+	custom derivatives, built on first use. They work inside jit and vmap, take
+	flat pixel and coefficient arrays and an explicit ring description, and are
+	what alm2map and map2alm call for JAX arrays. Returns a bunch with the two
+	functions."""
+	import jax
+	import jax.numpy as jnp
+	if not hasattr(ducc0.sht, "sht_ffi_targets"):
+		raise ImportError("this ducc0 build has no XLA handlers for the spherical harmonic "
+			"transforms: build it with DUCC0_USE_CUDA (or DUCC0_CUDA_EMULATE) and "
+			"DUCC0_XLA_INCLUDE set to jax.ffi.include_dir()")
+	for name, capsule in ducc0.sht.sht_ffi_targets().items():
+		jax.ffi.register_ffi_target(name, capsule, platform=_jax_platform())
+
+	def weight_m(x, attrs, inverse):
+		"""Multiplies the coefficients by ducc's factor for real fields: 2 for
+		m>0, since the map depends on the real and imaginary part of those
+		coefficients twice, and 1 for m=0; or divides by it. Done as a scalar
+		multiply and one strided slice update, so no weight array is built."""
+		sl = slice(int(attrs["mstart"][0]),
+			int(attrs["mstart"][0])+(attrs["lmax"]+1)*attrs["lstride"], attrs["lstride"])
+		f  = 0.5 if inverse else 2.0
+		return (f*x).at[...,sl].multiply(1/f)
+
+	def synthesis_call(alm, attrs):
+		nmap = _sht_ffi_ncomp(attrs["spins"], attrs["mode"])[0]
+		dtype = jnp.float32 if alm.dtype == jnp.complex64 else jnp.float64
+		out  = jax.ShapeDtypeStruct(alm.shape[:-2]+(nmap,_sht_ffi_npix(attrs)), dtype)
+		return jax.ffi.ffi_call("ducc0_sht_synthesis", out, vmap_method="expand_dims")(alm, **attrs)
+
+	def adjoint_call(map, attrs):
+		nalm = _sht_ffi_ncomp(attrs["spins"], attrs["mode"])[1]
+		dtype = jnp.complex64 if map.dtype == jnp.float32 else jnp.complex128
+		out  = jax.ShapeDtypeStruct(map.shape[:-2]+(nalm,_sht_ffi_nelem(attrs)), dtype)
+		return jax.ffi.ffi_call("ducc0_sht_adjoint_synthesis", out,
+			vmap_method="expand_dims")(map, **attrs)
+
+	@functools.partial(jax.custom_vjp, nondiff_argnums=(1,))
+	def synthesis_p(alm, key):
+		return synthesis_call(alm, key.attrs)
+	def synthesis_fwd(alm, key): return synthesis_p(alm, key), None
+	def synthesis_bwd(key, res, ct):
+		# JAX's cotangent of a complex input is the conjugate of the transpose
+		# of the real linear map, which is the adjoint synthesis with ducc's
+		# factor 2 for the m>0 coefficients
+		return (weight_m(jnp.conj(adjoint_call(ct, key.attrs)), key.attrs, False),)
+	synthesis_p.defvjp(synthesis_fwd, synthesis_bwd)
+
+	@functools.partial(jax.custom_vjp, nondiff_argnums=(1,))
+	def adjoint_p(map, key):
+		return adjoint_call(map, key.attrs)
+	def adjoint_fwd(map, key): return adjoint_p(map, key), None
+	def adjoint_bwd(key, res, ct):
+		return (synthesis_call(weight_m(jnp.conj(ct), key.attrs, True), key.attrs),)
+	adjoint_p.defvjp(adjoint_fwd, adjoint_bwd)
+
+	def synthesis_general_call(alm, loc, attrs):
+		nmap = _sht_ffi_ncomp(attrs["spins"], attrs["mode"])[0]
+		dtype = jnp.float32 if alm.dtype == jnp.complex64 else jnp.float64
+		out  = jax.ShapeDtypeStruct(alm.shape[:-2]+(nmap,loc.shape[0]), dtype)
+		return jax.ffi.ffi_call("ducc0_sht_synthesis_general", out,
+			vmap_method="expand_dims")(alm, loc, **attrs)
+
+	def adjoint_general_call(sig, loc, attrs):
+		nalm = _sht_ffi_ncomp(attrs["spins"], attrs["mode"])[1]
+		dtype = jnp.complex64 if sig.dtype == jnp.float32 else jnp.complex128
+		out  = jax.ShapeDtypeStruct(sig.shape[:-2]+(nalm,_sht_ffi_nelem(attrs)), dtype)
+		return jax.ffi.ffi_call("ducc0_sht_adjoint_synthesis_general", out,
+			vmap_method="expand_dims")(sig, loc, **attrs)
+
+	@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
+	def synthesis_general_p(alm, loc, key):
+		return synthesis_general_call(alm, loc, key.attrs)
+	def synthesis_general_fwd(alm, loc, key):
+		return synthesis_general_p(alm, loc, key), loc
+	def synthesis_general_bwd(key, loc, ct):
+		# the derivative with respect to the positions is not implemented, and a
+		# zero would be indistinguishable from a real one, so it is a nan: a
+		# gradient that never touches the positions is unaffected, and one that
+		# does comes back as nan rather than quietly wrong
+		return (weight_m(jnp.conj(adjoint_general_call(ct, loc, key.attrs)), key.attrs, False),
+			jnp.full_like(loc, jnp.nan))
+	synthesis_general_p.defvjp(synthesis_general_fwd, synthesis_general_bwd)
+
+	@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
+	def adjoint_general_p(sig, loc, key):
+		return adjoint_general_call(sig, loc, key.attrs)
+	def adjoint_general_fwd(sig, loc, key):
+		return adjoint_general_p(sig, loc, key), loc
+	def adjoint_general_bwd(key, loc, ct):
+		return (synthesis_general_call(weight_m(jnp.conj(ct), key.attrs, True), loc, key.attrs),
+			jnp.full_like(loc, jnp.nan))
+	adjoint_general_p.defvjp(adjoint_general_fwd, adjoint_general_bwd)
+
+	def synthesis(alm, *, spin, lmax, theta, nphi, phi0, ringstart, mstart=None,
+			lstride=1, mmax=None, mode="STANDARD", pixstride=1):
+		"""Spherical harmonic synthesis of a JAX coefficient array [...,nalm,nelem]
+		into the pixels of all rings [...,ncomp,npix]. spin is one spin or a list of
+		them, describing the component axis the way alm2map does. theta, nphi, phi0
+		and ringstart describe the rings as in ducc's synthesis, pixstride is the
+		index step between the pixels of a ring, and mstart, lstride and mmax the
+		coefficient layout. Differentiable with respect to alm."""
+		attrs = _sht_ffi_attrs(spin, lmax, theta, nphi, phi0, ringstart, mstart=mstart,
+			lstride=lstride, mmax=mmax, mode=mode, pixstride=pixstride)
+		alm   = jnp.asarray(alm)
+		if alm.ndim == 1: alm = alm[None]
+		return synthesis_p(alm, _ShtKey(attrs))
+
+	def adjoint_synthesis(map, *, spin, lmax, theta, nphi, phi0, ringstart, mstart=None,
+			lstride=1, mmax=None, mode="STANDARD", pixstride=1):
+		"""The transpose of synthesis, from the pixels of all rings to
+		coefficients. This applies no quadrature weights; see synthesis for the
+		arguments. Differentiable with respect to map."""
+		attrs = _sht_ffi_attrs(spin, lmax, theta, nphi, phi0, ringstart, mstart=mstart,
+			lstride=lstride, mmax=mmax, mode=mode, pixstride=pixstride)
+		map   = jnp.asarray(map)
+		if map.ndim == 1: map = map[None]
+		return adjoint_p(map, _ShtKey(attrs))
+
+	def synthesis_general(alm, *, loc, spin, lmax, epsilon, mstart=None, lstride=1,
+			mmax=None, mode="STANDARD", sigma_min=1.1, sigma_max=2.6):
+		"""Evaluates a JAX coefficient array [...,nalm,nelem] at the positions
+		loc [npoints,{colatitude,longitude}], giving [...,ncomp,npoints]. spin
+		describes the component axis the way alm2map does, epsilon is the
+		accuracy asked of the interpolation, and mstart, lstride and mmax give
+		the coefficient layout. Differentiable with respect to alm; the
+		positions. The derivative with respect to the positions themselves is
+		not implemented and comes back as nan, so that it cannot be mistaken
+		for a zero."""
+		attrs = _sht_ffi_general_attrs(spin, lmax, mstart=mstart, lstride=lstride,
+			mmax=mmax, mode=mode, epsilon=epsilon, sigma_min=sigma_min, sigma_max=sigma_max)
+		alm   = jnp.asarray(alm)
+		if alm.ndim == 1: alm = alm[None]
+		loc   = jnp.asarray(loc, dtype=jnp.float64)
+		return synthesis_general_p(alm, loc, _ShtKey(attrs))
+
+	def adjoint_synthesis_general(sig, *, loc, spin, lmax, epsilon, mstart=None,
+			lstride=1, mmax=None, mode="STANDARD", sigma_min=1.1, sigma_max=2.6):
+		"""The transpose of synthesis_general, from values at the positions to
+		coefficients. See synthesis_general for the arguments. Differentiable
+		with respect to the values. As for synthesis_general, the derivative
+		with respect to the positions is not implemented and comes back as
+		nan."""
+		attrs = _sht_ffi_general_attrs(spin, lmax, mstart=mstart, lstride=lstride,
+			mmax=mmax, mode=mode, epsilon=epsilon, sigma_min=sigma_min, sigma_max=sigma_max)
+		sig   = jnp.asarray(sig)
+		if sig.ndim == 1: sig = sig[None]
+		loc   = jnp.asarray(loc, dtype=jnp.float64)
+		return adjoint_general_p(sig, loc, _ShtKey(attrs))
+
+	return bunch.Bunch(synthesis=synthesis, adjoint_synthesis=adjoint_synthesis,
+		synthesis_general=synthesis_general,
+		adjoint_synthesis_general=adjoint_synthesis_general)
+
+#########################################
+### Transforms of arrays on a device  ###
+#########################################
+
+# alm2map and map2alm send any array that is not a numpy array here, so that the
+# same code runs on the CPU and on a GPU. The transforms themselves are ducc's
+# CUDA backend; for JAX arrays they go through the functions above. Only the "cyl" method exists here: every
+# cylindrical geometry with rows that divide the sky evenly, which includes the
+# CAR geometries of enmap. The map is described to ducc as it is stored, so no
+# flipping or copying is needed; only maps whose rows do not cover a full ring
+# are padded, into a temporary buffer.
+
+class RingGeometry:
+	"""The description of a cylindrical map as rings of pixels, as ducc takes it.
+	Usually built for you by the transforms, and cached, so it rarely needs to be
+	constructed by hand.
+
+	Parameters
+	----------
+	shape, wcs: the geometry of the map. Only the last two entries of shape are used.
+	pix_tol: tolerance when matching the pixel layout with a known one, in fractions
+	 of a pixel. Default: 1e-6.
+
+	Attributes
+	----------
+	theta, nphi, phi0, ringstart, pixstride: the ring description ducc takes.
+	xpad: the (left,right) padding needed to complete the rings. (0,0) unless the
+	 map covers only part of each ring.
+	padded: whether any padding is needed, that is, whether the transforms have to
+	 copy the map into a buffer.
+	npix: the number of pixels per component of that buffer.
+	"""
+	def __init__(self, shape, wcs, pix_tol=1e-6):
+		shape = tuple(shape[-2:])
+		minfo = analyse_geometry(shape, wcs, tol=pix_tol)
+		if minfo.case == "general":
+			raise ValueError("Only cylindrical pixelizations are supported on the device")
+		self.shape, self.wcs, self.pix_tol = shape, wcs, pix_tol
+		self.xpad   = (int(minfo.xpad[0]), int(minfo.xpad[1]))
+		self.padded = self.xpad != (0,0)
+		# The rings are those of the map padded to full rows, which is the map
+		# itself unless it covers only part of each ring
+		self.bshape, self.bwcs = pad_geometry(shape, wcs,
+			np.array([[0,self.xpad[0]],[0,self.xpad[1]]]))
+		rinfo = get_ring_info(self.bshape, self.bwcs)
+		self.theta, self.nphi, self.phi0 = rinfo.theta, rinfo.nphi, rinfo.phi0
+		self.ringstart = rinfo.offsets
+		self.pixstride = int(rinfo.stride[0])
+		self.npix      = int(rinfo.npix)
+		self._weights  = None
+	def ring_args(self):
+		"""The ring description as the keyword arguments of the transforms"""
+		return dict(theta=self.theta, nphi=self.nphi, phi0=self.phi0,
+			ringstart=self.ringstart, pixstride=self.pixstride)
+	def to_buffer(self, map):
+		"""Turn a map with this geometry into the flat [...,npix] pixel array the
+		transforms take. This is a reshape unless the map needs padding."""
+		if self.padded:
+			xp  = array_module(map)[1]
+			map = xp.pad(map, [(0,0)]*(map.ndim-1)+[self.xpad])
+		return map.reshape(map.shape[:-2]+(self.npix,))
+	def from_buffer(self, buf):
+		"""Turn a flat [...,npix] pixel array back into a [...,ny,nx] map with
+		this geometry. The inverse of to_buffer."""
+		map = buf.reshape(buf.shape[:-1]+self.bshape)
+		if self.padded: map = map[...,self.xpad[0]:self.xpad[0]+self.shape[-1]]
+		return map
+	def quad_weights(self):
+		"""The quadrature weights of the rings, in the row order of the map. The
+		exact weights of the underlying ducc geometry when there is one, and the
+		pixel areas otherwise, as map2alm does."""
+		if self._weights is None:
+			minfo = analyse_geometry(self.shape, self.wcs, tol=self.pix_tol)
+			if minfo.ducc_geo is not None and minfo.ducc_geo.name is not None:
+				self._weights = quad_weights(self.shape, self.wcs, pix_tol=self.pix_tol)
+			else:
+				self._weights = enmap.pixsizemap(self.shape, self.wcs, separable=True,
+					broadcastable=True)[:,0]
+		return self._weights
+	def __repr__(self):
+		return "RingGeometry(shape=%s, npix=%d, pixstride=%d, xpad=%s)" % (
+			str(self.shape), self.npix, self.pixstride, str(self.xpad))
+
+_geo_cache = {}
+def ring_geometry(geometry, pix_tol=1e-6, cache=8):
+	"""The RingGeometry of a shape and wcs, an enmap.Geometry or an enmap, built
+	once per geometry and then remembered, since the transforms are usually called
+	many times with the same one."""
+	if isinstance(geometry, RingGeometry): return geometry
+	shape, wcs = geometry_of(geometry)
+	key = (tuple(shape[-2:]), wcs.wcs.ctype[0], wcs.wcs.ctype[1], tuple(wcs.wcs.cdelt),
+		tuple(wcs.wcs.crval), tuple(wcs.wcs.crpix), pix_tol)
+	if key not in _geo_cache:
+		if len(_geo_cache) >= cache: _geo_cache.pop(next(iter(_geo_cache)))
+		_geo_cache[key] = RingGeometry(shape, wcs, pix_tol=pix_tol)
+	return _geo_cache[key]
+
+def geometry_of(obj):
+	"""The (shape, wcs) of an enmap, an enmap.devmap, an enmap.Geometry, a
+	RingGeometry or a (shape, wcs) pair."""
+	if isinstance(obj, RingGeometry): return obj.shape, obj.wcs
+	if hasattr(obj, "wcs") and hasattr(obj, "shape"): return obj.shape, obj.wcs
+	if obj is None or not hasattr(obj, "__len__") or len(obj) != 2:
+		raise ValueError("The map does not carry a geometry. Maps on a device are "
+			"wrapped in an enmap.devmap, which holds the pixels and the wcs.")
+	shape, wcs = obj
+	return shape, wcs
+
+def pixels(map):
+	"""The pixel array of a map, which is the map itself unless it is a devmap"""
+	return map.arr if isinstance(map, enmap.devmap) else map
+
+def is_geometry(obj):
+	"""Whether obj describes a geometry rather than the pixels of a map"""
+	if isinstance(obj, (RingGeometry, enmap.Geometry)): return True
+	return isinstance(obj, tuple) and len(obj) == 2 and hasattr(obj[1], "wcs")
+
+def is_device_array(obj):
+	"""Whether obj is an array that is not a numpy array, such as a CuPy or JAX one"""
+	return obj is not None and not isinstance(obj, np.ndarray) \
+		and hasattr(obj, "shape") and hasattr(obj, "dtype")
+
+def array_module(arr):
+	"""The name of the array library arr belongs to ("jax", "cupy" or "numpy")
+	together with its numpy-like module."""
+	root = type(arr).__module__.split(".")[0]
+	if root in ("jax","jaxlib"):
+		import jax.numpy
+		return "jax", jax.numpy
+	if root == "cupy":
+		import cupy
+		return "cupy", cupy
+	return "numpy", np
+
+def _device_alm2map(alm, map=None, spin=[0,2], deriv=False, adjoint=False, copy=False,
+		ainfo=None, lmax=None, mmax=None, nthread=None, pix_tol=1e-6, method="auto"):
+	"""Spherical harmonics synthesis for arrays that may live on a GPU. Called by
+	alm2map; see its docstring. The map argument carries the geometry:
+	it is an enmap, an enmap.devmap or a geometry, and in the last case a new map
+	is allocated in the same array library as the coefficients. With adjoint=True
+	the transform goes the other way, from map to alm, without quadrature
+	weights."""
+	check_method(method)
+	geom = ring_geometry(map, pix_tol=pix_tol)
+	if is_geometry(map): map = None
+	if adjoint:
+		implicit = _implicit_ncomp(pixels(map), 2, deriv)
+		buf   = geom.to_buffer(_ncomp_axes(pixels(map), 2, copy))
+		ainfo = get_ainfo(ainfo, lmax, mmax, None if alm is None else alm.shape[-1])
+		Y, YT = _ops(ainfo, spin, buf.shape[-2], deriv, buf, nthread, geom=geom)
+		return _store(_drop_ncomp(YT(buf), implicit), alm)
+	implicit = _implicit_ncomp(alm, 1, deriv)
+	alm   = _ncomp_axes(alm, 1, copy)
+	ainfo = get_ainfo(ainfo, lmax, mmax, alm.shape[-1])
+	Y, YT = _ops(ainfo, spin, alm.shape[-2], deriv, alm, nthread, geom=geom)
+	kind  = array_module(alm)[0]
+	out, buf_out = None, pixels(map)
+	if buf_out is not None and kind == array_module(buf_out)[0] and kind != "jax" \
+			and not geom.padded and buf_out.flags.c_contiguous \
+			and buf_out.dtype == utils.real_dtype(alm.dtype):
+		out = geom.to_buffer(buf_out)   # the transform can write into the map itself
+	buf = Y(alm, out=out)
+	if out is not None: return map
+	return _store(_drop_ncomp(geom.from_buffer(buf), implicit), map, geom)
+
+def _device_alm2map_pos(alm, loc, map=None, ainfo=None, spin=[0,2], deriv=False,
+		adjoint=False, copy=False, nthread=None, epsilon=None):
+	"""Transform between coefficients and values at arbitrary positions, for
+	arrays that may live on a GPU. Called by alm2map_pos; see its docstring.
+	loc holds the positions as ducc takes them, [npoints,{colatitude,longitude}].
+	There is no geometry here, so the values come back as a plain array of the
+	same library as the coefficients."""
+	ref      = map if adjoint else alm
+	kind, xp = array_module(ref)
+	if epsilon is None:
+		epsilon = 1e-10 if utils.real_dtype(ref.dtype) == np.float64 else 1e-6
+	# ducc takes the positions in double precision; the JAX wrapper casts them
+	# itself, since jnp only has float64 with x64 enabled
+	if   kind == "cupy":  loc = xp.asarray(loc, dtype=np.float64)
+	elif kind == "numpy": loc = np.ascontiguousarray(loc, dtype=np.float64)
+	if adjoint:
+		implicit = _implicit_ncomp(map, 1, deriv)
+		buf   = _ncomp_axes(map, 1, copy)
+		ainfo = get_ainfo(ainfo, None, None, None if alm is None else alm.shape[-1])
+		Y, YT = _ops(ainfo, spin, buf.shape[-2], deriv, buf, nthread, loc=loc, epsilon=epsilon)
+		return _store(_drop_ncomp(YT(buf), implicit), alm)
+	implicit = _implicit_ncomp(alm, 1, deriv)
+	alm   = _ncomp_axes(alm, 1, copy)
+	ainfo = get_ainfo(ainfo, None, None, alm.shape[-1])
+	Y, YT = _ops(ainfo, spin, alm.shape[-2], deriv, alm, nthread, loc=loc, epsilon=epsilon)
+	return _store(_drop_ncomp(Y(alm), implicit), map)
+
+def _device_map2alm(map, alm=None, spin=[0,2], deriv=False, adjoint=False, copy=False,
+		ainfo=None, lmax=None, mmax=None, weights=None, niter=0, nthread=None, pix_tol=1e-6,
+		method="auto"):
+	"""Spherical harmonics analysis for arrays that may live on a GPU. Called by
+	map2alm; see its docstring. The map carries its geometry, by being an
+	enmap or an enmap.devmap. With adjoint=True the transform goes the other way,
+	from alm to map."""
+	check_method(method)
+	geom = ring_geometry(map, pix_tol=pix_tol)
+	if adjoint:
+		implicit = _implicit_ncomp(alm, 1, deriv)
+		alm   = _ncomp_axes(alm, 1, copy)
+		ainfo = get_ainfo(ainfo, lmax, mmax, alm.shape[-1])
+		ncomp = alm.shape[-2]
+	else:
+		implicit = _implicit_ncomp(pixels(map), 2, deriv)
+		map   = _ncomp_axes(pixels(map), 2, copy)
+		ainfo = get_ainfo(ainfo, lmax, mmax, None)
+		ncomp = 2 if deriv else map.shape[-3]
+	ref   = alm if adjoint else map
+	Y, YT = _ops(ainfo, spin, ncomp, deriv, ref, nthread, geom=geom)
+	xp    = array_module(ref)[1]
+	if weights is None: weights = geom.quad_weights()
+	if weights is not False:
+		weights = xp.asarray(np.ascontiguousarray(weights, dtype=utils.real_dtype(
+			utils.native_dtype(ref.dtype) if adjoint else ref.dtype)))
+	def W(buf): return buf if weights is False else _wmul(buf, geom, weights)
+	if adjoint:
+		res = jacobi_inverse(YT, lambda a: W(Y(a)), alm, niter=niter)
+		return _store(_drop_ncomp(geom.from_buffer(res), implicit), map, geom)
+	res = jacobi_inverse(Y, lambda b: YT(W(b)), geom.to_buffer(map), niter=niter)
+	return _store(_drop_ncomp(res, implicit), alm)
+
+def check_method(method):
+	if method not in ("auto","cyl"):
+		raise ValueError("Only the cyl method is available for arrays on a device, not '%s'"
+			% str(method))
+
+def get_ainfo(ainfo, lmax, mmax, nalm):
+	if ainfo is not None: return ainfo
+	if lmax  is not None: return alm_info(lmax=lmax, mmax=mmax)
+	if nalm  is not None: return alm_info(nalm=nalm)
+	raise ValueError("Either ainfo or lmax is needed")
+
+def _ncomp_axes(arr, pixdims, copy):
+	"""Give the array an explicit component axis, and copy it if asked to"""
+	if arr is None: raise ValueError("Missing the input array of the transform")
+	if copy: arr = arr.copy()
+	if arr.ndim == pixdims: arr = arr[None]
+	return arr
+
+def _implicit_ncomp(arr, pixdims, deriv):
+	"""Whether the array leaves the component axis implicit, as a single map or
+	a single set of coefficients does. The result of the transform then has no
+	component axis either, so that arrays on a device behave like numpy ones."""
+	return (not deriv) and (arr is not None) and (getattr(arr, "ndim", 0) == pixdims)
+
+def _drop_ncomp(res, implicit):
+	"""Remove the component axis again if the caller left it implicit"""
+	return res[0] if implicit else res
+
+def _store(res, out, geom=None):
+	"""Return the result, put into the caller's array if there was one. A map
+	comes back as an enmap when its pixels are in memory and as a devmap when
+	they are on a device, so that it carries its geometry either way."""
+	if out is not None and not is_geometry(out):
+		if array_module(res)[0] == "jax" or array_module(pixels(out))[0] == "jax":
+			raise ValueError("JAX arrays cannot be written into: leave the output array "
+				"out and use the returned one. For a map, pass a geometry or a devmap "
+				"as the map argument instead.")
+		pixels(out)[:] = res
+		return out
+	if geom is not None:
+		return enmap.ndmap(res, geom.wcs) if isinstance(res, np.ndarray) \
+			else enmap.devmap(res, geom.wcs)
+	return res
+
+def _wmul(buf, geom, weights):
+	"""Multiply each ring of a flat pixel buffer with its quadrature weight"""
+	return (buf.reshape(buf.shape[:-1]+geom.bshape)*weights[:,None]).reshape(buf.shape)
+
+def _ops(ainfo, spin, ncomp, deriv, ref, nthread, geom=None, loc=None, epsilon=None):
+	"""The synthesis Y and its transpose YT as functions of flat arrays, for the
+	array library of ref. With a geom these are the ring transforms, with a loc
+	the transforms at arbitrary positions. With deriv both use ducc's DERIV1
+	mode, and the theta derivative is negated to make it the declination
+	derivative."""
+	kind, xp = array_module(ref)
+	args = dict(lmax=ainfo.lmax, mmax=ainfo.mmax, mstart=ainfo.mstart, lstride=ainfo.stride)
+	if geom is None:
+		args.update(loc=loc, epsilon=epsilon)
+		npix = loc.shape[0]
+	else:
+		args.update(geom.ring_args())
+		npix = geom.npix
+	spins = [1] if deriv else [s for s, i1, i2 in enmap.spin_helper(spin, ncomp)]
+	mode  = "DERIV1" if deriv else "STANDARD"
+	flip  = xp.asarray(np.array([-1.0,1.0])[:,None]) if deriv else None
+	general = geom is None
+	def Y(alm, out=None):
+		buf = _synthesis(alm, npix, spins, mode, args, kind, xp, out=out,
+			nthread=nthread, general=general)
+		return buf if flip is None else buf*flip
+	def YT(buf):
+		if flip is not None: buf = buf*flip
+		return _adjoint(buf, ainfo, spins, mode, args, kind, xp, nthread=nthread,
+			general=general)
+	return Y, YT
+
+def _nmaps(spins, mode):
+	return 2 if mode != "STANDARD" else sum(1 if s == 0 else 2 for s in spins)
+
+def _groups(spins, mode, n):
+	"""The (spin, first, last) component groups of a transform"""
+	if mode != "STANDARD": return [(spins[0], 0, n)]
+	return list(enmap.spin_helper(spins, n))
+
+def _sht_func(kind, general, adjoint):
+	"""ducc's transform for one array library: the ring based one, or the one at
+	arbitrary positions, which takes loc and epsilon instead of a geometry."""
+	name = ("adjoint_synthesis" if adjoint else "synthesis") + ("_general" if general else "")
+	if kind == "jax":  return getattr(_jax_sht(), name)
+	if kind == "cupy": return getattr(ducc0.sht, name + "_cuda")
+	return getattr(ducc0.sht.experimental, name)
+
+def _synthesis(alm, npix, spins, mode, args, kind, xp, out=None, nthread=None, general=False):
+	"""Synthesis from alm [...,nalm,nelem] to a flat pixel buffer [...,ncomp,npix]"""
+	func = _sht_func(kind, general, False)
+	if kind == "jax":
+		return func(alm, spin=spins, mode=mode, **args)
+	if out is None:
+		out = xp.empty(alm.shape[:-2]+(_nmaps(spins,mode),npix), utils.real_dtype(alm.dtype))
+	def call(a, m, s):
+		kw = {} if kind == "cupy" else dict(nthreads=_nthread(nthread))
+		func(alm=a, map=m, spin=s, mode=mode, **kw, **args)
+	if mode != "STANDARD": call(alm, out, spins[0])
+	else:
+		for s, j1, j2 in enmap.spin_helper(spins, alm.shape[-2]):
+			call(alm[...,j1:j2,:], out[...,j1:j2,:], s)
+	return out
+
+def _adjoint(buf, ainfo, spins, mode, args, kind, xp, nthread=None, general=False):
+	"""Adjoint synthesis from a flat pixel buffer [...,ncomp,npix] to alm"""
+	func = _sht_func(kind, general, True)
+	if kind == "jax":
+		return func(buf, spin=spins, mode=mode, **args)
+	nalm = 1 if mode != "STANDARD" else buf.shape[-2]
+	out  = xp.empty(buf.shape[:-2]+(nalm,ainfo.nelem), utils.complex_dtype(buf.dtype))
+	def call(m, a, s):
+		kw = {} if kind == "cupy" else dict(nthreads=_nthread(nthread))
+		func(map=m, alm=a, spin=s, mode=mode, **kw, **args)
+	if mode != "STANDARD": call(buf, out, spins[0])
+	else:
+		for s, j1, j2 in enmap.spin_helper(spins, buf.shape[-2]):
+			call(buf[...,j1:j2,:], out[...,j1:j2,:], s)
+	return out
+
+def _nthread(nthread):
+	return int(utils.fallback(utils.getenv("OMP_NUM_THREADS", nthread), 0))
