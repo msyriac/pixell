@@ -1817,7 +1817,7 @@ class RingGeometry:
 		minfo = analyse_geometry(shape, wcs, tol=pix_tol)
 		if minfo.case == "general":
 			raise ValueError("Only cylindrical pixelizations are supported on the device")
-		self.shape, self.wcs, self.pix_tol = shape, wcs, pix_tol
+		self.shape, self.wcs, self.pix_tol, self.minfo = shape, wcs, pix_tol, minfo
 		self.xpad   = (int(minfo.xpad[0]), int(minfo.xpad[1]))
 		self.padded = self.xpad != (0,0)
 		# The rings are those of the map padded to full rows, which is the map
@@ -1852,7 +1852,7 @@ class RingGeometry:
 		exact weights of the underlying ducc geometry when there is one, and the
 		pixel areas otherwise, as map2alm does."""
 		if self._weights is None:
-			minfo = analyse_geometry(self.shape, self.wcs, tol=self.pix_tol)
+			minfo = self.minfo
 			if minfo.ducc_geo is not None and minfo.ducc_geo.name is not None:
 				self._weights = quad_weights(self.shape, self.wcs, pix_tol=self.pix_tol)
 			else:
@@ -2081,14 +2081,6 @@ def _ops(ainfo, spin, ncomp, deriv, ref, nthread, geom=None, loc=None, epsilon=N
 			general=general)
 	return Y, YT
 
-def _nmaps(spins, mode):
-	return 2 if mode != "STANDARD" else sum(1 if s == 0 else 2 for s in spins)
-
-def _groups(spins, mode, n):
-	"""The (spin, first, last) component groups of a transform"""
-	if mode != "STANDARD": return [(spins[0], 0, n)]
-	return list(enmap.spin_helper(spins, n))
-
 def _sht_func(kind, general, adjoint):
 	"""ducc's transform for one array library: the ring based one, or the one at
 	arbitrary positions, which takes loc and epsilon instead of a geometry."""
@@ -2103,7 +2095,8 @@ def _synthesis(alm, npix, spins, mode, args, kind, xp, out=None, nthread=None, g
 	if kind == "jax":
 		return func(alm, spin=spins, mode=mode, **args)
 	if out is None:
-		out = xp.empty(alm.shape[:-2]+(_nmaps(spins,mode),npix), utils.real_dtype(alm.dtype))
+		out = xp.empty(alm.shape[:-2]+(_sht_ffi_ncomp(spins,mode)[0],npix),
+			utils.real_dtype(alm.dtype))
 	def call(a, m, s):
 		kw = {} if kind == "cupy" else dict(nthreads=_nthread(nthread))
 		func(alm=a, map=m, spin=s, mode=mode, **kw, **args)
