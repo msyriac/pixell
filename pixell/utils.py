@@ -870,30 +870,27 @@ def pixwin_1d(f, order=0):
 		raise ValueError("Unsupported order '%s'" % str(order))
 
 def nearest_product(n, factors, direction="below"):
-	"""Compute the highest product of positive integer powers of the specified
-	factors that is lower than or equal to n. This is done using a simple,
-	O(n) brute-force algorithm."""
-	below = direction=="below"
-	ni = floor(n) if below else ceil(n)
-	if 1 in factors: return ni
-	nmax = ni+1 if below else ni*min(factors)+1
-	# a keeps track of all the visited multiples
-	a = np.zeros(nmax+1,dtype=bool)
-	a[1] = True
-	best = None
-	for i in range(ni+1):
-		if not a[i]: continue
-		for f in factors:
-			m = i*f
-			if below:
-				if m > n: continue
-				else: best = m
-			else:
-				if m >= n and (best is None or best > m):
-					best = m
-			if m < a.size:
-				a[m] = True
-	return best
+	"""If direction = "below", then for each n calculate the highest product
+	of the factors that's <= to n. If direction = "above", calculate the
+	smallest product thats >= n. Vectorized over n. Scales as O(len(n)*log(max(n)))"""
+	below = direction == "below"
+	if below: vmax = np.max(n)+1
+	else:     vmax = np.max(n)*np.min(factors)
+	# Generate all possible products
+	products = {1}
+	queue    = [1]
+	while queue:
+		val = queue.pop()
+		for factor in factors:
+			prod = val*factor
+			if prod < vmax and prod not in products:
+				products.add(prod)
+				queue.append(prod)
+	# Can now look up each of our numbers
+	products = np.sort(list(products))
+	inds     = np.searchsorted(products, n, side="right")-1
+	if not below: inds += products[inds]!=n
+	return products[inds]
 
 def mkdir(path):
 	# It's useful to be able to do mkdir(os.path.dirname(fname)) to create the directory
@@ -962,7 +959,7 @@ def find_period_exact(d, guess):
 	period,phase = scipy.optimize.fmin_powell(chisq, [guess,guess], xtol=1, disp=False)
 	return period, phase+off, chisq([period,phase])/np.var(d**2)
 
-def find_sweeps(az, tol=0.2):
+def find_sweeps(az, tol=0.2, return_dir=False):
 	"""Given an array "az" that sweeps up and down between approximately
 	constant minimum and maximum values, returns an array sweeps[:,{i1,i2}],
 	which gives the start and end index of each such sweep. For example, if
@@ -982,7 +979,12 @@ def find_sweeps(az, tol=0.2):
 	turns      = np.array(scipy.ndimage.maximum_position(aabs, labels, np.arange(1,nlabel+1)))[:,0]
 	turns      = np.unique(np.concatenate([[0],turns,[len(az)]]))
 	sweeps     = np.array([turns[:-1],turns[1:]]).T
-	return sweeps
+	if return_dir:
+		# dir is 0 if first sweep has increasing az, otherwise 1
+		dir = az[sweeps[0,1]] < az[sweeps[0,0]] if len(sweeps) > 0 else 0
+		return sweeps, dir
+	else:
+		return sweeps
 
 def equal_split(weights, nbin):
 	"""Split weights into nbin bins such that the total
@@ -2877,7 +2879,8 @@ def build_conditional(ps, inds, axes=[0,1]):
 	cov    = partial_expand(Ciuui, ps.shape, axes)
 	return A, cov
 
-def nint(a, mul=1):
+def nint(a): return round(a)
+def round(a, mul=1):
 	"""Return a rounded to the nearest integer, as an integer."""
 	if mul==1: return np.round(a).astype(int)
 	else:      return np.round(a/a).astype(int)*mul
@@ -4046,3 +4049,21 @@ def firstin(ref, alts):
 
 def getrec(struct_arr, potential_colnames):
 	return struct_arr[firstin(struct_arr.dtype.names, potential_colnames)]
+
+class CommaArgparse:
+	def __init__(self):
+		import argparse
+		self.parser = argparse.ArgumentParser()
+	def add_argument(self, *args, **kwargs):
+		self.parser.add_argument(*args, **kwargs)
+	@staticmethod
+	def split_word(word):
+		for tok in word.split(","):
+			if "=" in tok: yield "--" + tok
+			else: yield tok
+	def parse_args(self, word):
+		argv = []
+		for tok in split_outside(word, ",", '"', '"'):
+			if "=" in tok: argv.append("--"+tok)
+			else: argv.append(tok)
+		return self.parser.parse_args(argv)
