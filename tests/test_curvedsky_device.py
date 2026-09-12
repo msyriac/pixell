@@ -6,6 +6,8 @@ against the transforms curvedsky does itself. The JAX and CuPy tests need a
 ducc0 built with the CUDA spherical harmonic backend, and are skipped
 otherwise.
 """
+import os
+
 import numpy as np
 import pytest
 import ducc0
@@ -25,6 +27,7 @@ def jax_modules():
     if not has_ffi:
         pytest.skip("this ducc0 build has no XLA handlers")
     jax = pytest.importorskip("jax")
+    os.environ.setdefault("PIXELL_ALLOW_CPU_JAX", "1")  # these tests cover the emulation
     jax.config.update("jax_enable_x64", True)
     # jax calls every accelerator "gpu", the handlers are registered for "CUDA"
     want = curvedsky._jax_platform().lower()

@@ -1558,12 +1558,13 @@ def alm_real2complex(ralm, ainfo=None):
 # and because the handlers may only be registered once.
 
 def _jax_platform():
-	"""The JAX platform ducc's handlers are registered for: "CUDA", or "cpu"
-	for a build with the emulated backend."""
-	return ducc0.sht.sht_ffi_platform
+	"""The JAX platform ducc's device handlers are registered for: "CUDA", "cpu"
+	for a build with the emulated backend, and None for a build that has only the
+	handlers of the CPU transforms."""
+	return getattr(ducc0.sht, "sht_ffi_platform", None)
 
 def _sht_ffi_attrs(spin, lmax, theta, nphi, phi0, ringstart, mstart=None, lstride=1,
-		mmax=None, mode="STANDARD", pixstride=1):
+		mmax=None, mode="STANDARD", pixstride=1, nthreads=0):
 	"""The geometry and layout of a transform, as the attributes ducc's XLA
 	handlers take. The default alm layout is the triangular one."""
 	spins = [int(spin)] if np.ndim(spin) == 0 else [int(s) for s in spin]
@@ -1579,10 +1580,11 @@ def _sht_ffi_attrs(spin, lmax, theta, nphi, phi0, ringstart, mstart=None, lstrid
 		nphi      = np.ascontiguousarray(nphi,      dtype=np.int64),
 		phi0      = np.ascontiguousarray(phi0,      dtype=np.float64),
 		ringstart = np.ascontiguousarray(ringstart, dtype=np.int64),
-		mstart    = np.ascontiguousarray(mstart,    dtype=np.int64))
+		mstart    = np.ascontiguousarray(mstart,    dtype=np.int64),
+		nthreads  = int(nthreads))
 
 def _sht_ffi_general_attrs(spin, lmax, mstart=None, lstride=1, mmax=None,
-		mode="STANDARD", epsilon=1e-10, sigma_min=1.1, sigma_max=2.6):
+		mode="STANDARD", epsilon=1e-10, sigma_min=1.1, sigma_max=2.6, nthreads=0):
 	"""The layout and accuracy of a transform at arbitrary positions, as the
 	attributes ducc's XLA handlers take. The positions themselves are an
 	argument of the call, not an attribute."""
@@ -1597,7 +1599,8 @@ def _sht_ffi_general_attrs(spin, lmax, mstart=None, lstride=1, mmax=None,
 		mstart    = np.ascontiguousarray(mstart, dtype=np.int64),
 		epsilon   = float(epsilon),
 		sigma_min = float(sigma_min),
-		sigma_max = float(sigma_max))
+		sigma_max = float(sigma_max),
+		nthreads  = int(nthreads))
 
 def _sht_ffi_ncomp(spins, mode):
 	"""Number of map components and of alm rows the transform has. A spin 0
@@ -1625,6 +1628,15 @@ class _ShtKey:
 	def __eq__(self, other): return self is other
 
 @functools.lru_cache(maxsize=None)
+def _jax_emulation_allowed():
+	"""Whether the JAX transforms may use ducc's emulated device backend on the CPU.
+	That emulation runs the GPU kernels on the host and is far slower than the CPU
+	transforms, so it has to be asked for with PIXELL_ALLOW_CPU_JAX=1 and is meant
+	for testing the device code without a GPU."""
+	import os
+	return os.environ.get("PIXELL_ALLOW_CPU_JAX", "") not in ("", "0")
+
+@functools.lru_cache(maxsize=None)
 def _jax_sht():
 	"""ducc's ring based synthesis and adjoint synthesis as JAX functions, with
 	custom derivatives, built on first use. They work inside jit and vmap, take
@@ -1633,12 +1645,34 @@ def _jax_sht():
 	functions."""
 	import jax
 	import jax.numpy as jnp
-	if not hasattr(ducc0.sht, "sht_ffi_targets"):
+	cpu_targets = ducc0.sht.sht_ffi_cpu_targets() if hasattr(ducc0.sht, "sht_ffi_cpu_targets") else {}
+	dev_targets = ducc0.sht.sht_ffi_targets()     if hasattr(ducc0.sht, "sht_ffi_targets")     else {}
+	if not cpu_targets and not dev_targets:
 		raise ImportError("this ducc0 build has no XLA handlers for the spherical harmonic "
-			"transforms: build it with DUCC0_USE_CUDA (or DUCC0_CUDA_EMULATE) and "
-			"DUCC0_XLA_INCLUDE set to jax.ffi.include_dir()")
-	for name, capsule in ducc0.sht.sht_ffi_targets().items():
+			"transforms: build it with DUCC0_XLA_INCLUDE set to jax.ffi.include_dir(), and "
+			"with DUCC0_USE_CUDA for the GPU ones")
+	# the CPU handlers call ducc's ordinary CPU transforms, the device ones the CUDA
+	# backend (or its emulation, which is registered for the CPU platform as well)
+	for name, capsule in cpu_targets.items():
+		jax.ffi.register_ffi_target(name, capsule, platform="cpu")
+	for name, capsule in dev_targets.items():
 		jax.ffi.register_ffi_target(name, capsule, platform=_jax_platform())
+	on_device = jax.default_backend() != "cpu"
+	emulated  = bool(dev_targets) and str(_jax_platform()).lower() == "cpu"
+	if on_device:
+		if not dev_targets or emulated:
+			raise RuntimeError("JAX runs on a GPU but this ducc0 build has no CUDA handlers: "
+				"build it with DUCC0_USE_CUDA and DUCC0_XLA_INCLUDE")
+		suffix = ""
+	elif emulated and _jax_emulation_allowed():
+		suffix = ""     # the emulated kernels, for testing the device code without a GPU
+	elif cpu_targets:
+		suffix = "_cpu" # ducc's CPU transforms, as fast as the ones the numpy path uses
+	else:
+		raise RuntimeError("JAX runs on the CPU and this ducc0 build has only the emulated "
+			"device handlers, which are far slower than the CPU transforms. Rebuild ducc0 "
+			"with DUCC0_XLA_INCLUDE to get the CPU handlers, or set PIXELL_ALLOW_CPU_JAX=1 "
+			"to use the emulation anyway, which is meant for testing")
 
 	def weight_m(x, attrs, inverse):
 		"""Multiplies the coefficients by ducc's factor for real fields: 2 for
@@ -1654,13 +1688,13 @@ def _jax_sht():
 		nmap = _sht_ffi_ncomp(attrs["spins"], attrs["mode"])[0]
 		dtype = jnp.float32 if alm.dtype == jnp.complex64 else jnp.float64
 		out  = jax.ShapeDtypeStruct(alm.shape[:-2]+(nmap,_sht_ffi_npix(attrs)), dtype)
-		return jax.ffi.ffi_call("ducc0_sht_synthesis", out, vmap_method="expand_dims")(alm, **attrs)
+		return jax.ffi.ffi_call("ducc0_sht_synthesis"+suffix, out, vmap_method="expand_dims")(alm, **attrs)
 
 	def adjoint_call(map, attrs):
 		nalm = _sht_ffi_ncomp(attrs["spins"], attrs["mode"])[1]
 		dtype = jnp.complex64 if map.dtype == jnp.float32 else jnp.complex128
 		out  = jax.ShapeDtypeStruct(map.shape[:-2]+(nalm,_sht_ffi_nelem(attrs)), dtype)
-		return jax.ffi.ffi_call("ducc0_sht_adjoint_synthesis", out,
+		return jax.ffi.ffi_call("ducc0_sht_adjoint_synthesis"+suffix, out,
 			vmap_method="expand_dims")(map, **attrs)
 
 	@functools.partial(jax.custom_vjp, nondiff_argnums=(1,))
@@ -1686,14 +1720,14 @@ def _jax_sht():
 		nmap = _sht_ffi_ncomp(attrs["spins"], attrs["mode"])[0]
 		dtype = jnp.float32 if alm.dtype == jnp.complex64 else jnp.float64
 		out  = jax.ShapeDtypeStruct(alm.shape[:-2]+(nmap,loc.shape[0]), dtype)
-		return jax.ffi.ffi_call("ducc0_sht_synthesis_general", out,
+		return jax.ffi.ffi_call("ducc0_sht_synthesis_general"+suffix, out,
 			vmap_method="expand_dims")(alm, loc, **attrs)
 
 	def adjoint_general_call(sig, loc, attrs):
 		nalm = _sht_ffi_ncomp(attrs["spins"], attrs["mode"])[1]
 		dtype = jnp.complex64 if sig.dtype == jnp.float32 else jnp.complex128
 		out  = jax.ShapeDtypeStruct(sig.shape[:-2]+(nalm,_sht_ffi_nelem(attrs)), dtype)
-		return jax.ffi.ffi_call("ducc0_sht_adjoint_synthesis_general", out,
+		return jax.ffi.ffi_call("ducc0_sht_adjoint_synthesis_general"+suffix, out,
 			vmap_method="expand_dims")(sig, loc, **attrs)
 
 	@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
@@ -1721,7 +1755,7 @@ def _jax_sht():
 	adjoint_general_p.defvjp(adjoint_general_fwd, adjoint_general_bwd)
 
 	def synthesis(alm, *, spin, lmax, theta, nphi, phi0, ringstart, mstart=None,
-			lstride=1, mmax=None, mode="STANDARD", pixstride=1):
+			lstride=1, mmax=None, mode="STANDARD", pixstride=1, nthreads=0):
 		"""Spherical harmonic synthesis of a JAX coefficient array [...,nalm,nelem]
 		into the pixels of all rings [...,ncomp,npix]. spin is one spin or a list of
 		them, describing the component axis the way alm2map does. theta, nphi, phi0
@@ -1729,24 +1763,24 @@ def _jax_sht():
 		index step between the pixels of a ring, and mstart, lstride and mmax the
 		coefficient layout. Differentiable with respect to alm."""
 		attrs = _sht_ffi_attrs(spin, lmax, theta, nphi, phi0, ringstart, mstart=mstart,
-			lstride=lstride, mmax=mmax, mode=mode, pixstride=pixstride)
+			lstride=lstride, mmax=mmax, mode=mode, pixstride=pixstride, nthreads=nthreads)
 		alm   = jnp.asarray(alm)
 		if alm.ndim == 1: alm = alm[None]
 		return synthesis_p(alm, _ShtKey(attrs))
 
 	def adjoint_synthesis(map, *, spin, lmax, theta, nphi, phi0, ringstart, mstart=None,
-			lstride=1, mmax=None, mode="STANDARD", pixstride=1):
+			lstride=1, mmax=None, mode="STANDARD", pixstride=1, nthreads=0):
 		"""The transpose of synthesis, from the pixels of all rings to
 		coefficients. This applies no quadrature weights; see synthesis for the
 		arguments. Differentiable with respect to map."""
 		attrs = _sht_ffi_attrs(spin, lmax, theta, nphi, phi0, ringstart, mstart=mstart,
-			lstride=lstride, mmax=mmax, mode=mode, pixstride=pixstride)
+			lstride=lstride, mmax=mmax, mode=mode, pixstride=pixstride, nthreads=nthreads)
 		map   = jnp.asarray(map)
 		if map.ndim == 1: map = map[None]
 		return adjoint_p(map, _ShtKey(attrs))
 
 	def synthesis_general(alm, *, loc, spin, lmax, epsilon, mstart=None, lstride=1,
-			mmax=None, mode="STANDARD", sigma_min=1.1, sigma_max=2.6):
+			mmax=None, mode="STANDARD", sigma_min=1.1, sigma_max=2.6, nthreads=0):
 		"""Evaluates a JAX coefficient array [...,nalm,nelem] at the positions
 		loc [npoints,{colatitude,longitude}], giving [...,ncomp,npoints]. spin
 		describes the component axis the way alm2map does, epsilon is the
@@ -1756,21 +1790,23 @@ def _jax_sht():
 		not implemented and comes back as nan, so that it cannot be mistaken
 		for a zero."""
 		attrs = _sht_ffi_general_attrs(spin, lmax, mstart=mstart, lstride=lstride,
-			mmax=mmax, mode=mode, epsilon=epsilon, sigma_min=sigma_min, sigma_max=sigma_max)
+			mmax=mmax, mode=mode, epsilon=epsilon, sigma_min=sigma_min, sigma_max=sigma_max,
+			nthreads=nthreads)
 		alm   = jnp.asarray(alm)
 		if alm.ndim == 1: alm = alm[None]
 		loc   = jnp.asarray(loc, dtype=jnp.float64)
 		return synthesis_general_p(alm, loc, _ShtKey(attrs))
 
 	def adjoint_synthesis_general(sig, *, loc, spin, lmax, epsilon, mstart=None,
-			lstride=1, mmax=None, mode="STANDARD", sigma_min=1.1, sigma_max=2.6):
+			lstride=1, mmax=None, mode="STANDARD", sigma_min=1.1, sigma_max=2.6, nthreads=0):
 		"""The transpose of synthesis_general, from values at the positions to
 		coefficients. See synthesis_general for the arguments. Differentiable
 		with respect to the values. As for synthesis_general, the derivative
 		with respect to the positions is not implemented and comes back as
 		nan."""
 		attrs = _sht_ffi_general_attrs(spin, lmax, mstart=mstart, lstride=lstride,
-			mmax=mmax, mode=mode, epsilon=epsilon, sigma_min=sigma_min, sigma_max=sigma_max)
+			mmax=mmax, mode=mode, epsilon=epsilon, sigma_min=sigma_min, sigma_max=sigma_max,
+			nthreads=nthreads)
 		sig   = jnp.asarray(sig)
 		if sig.ndim == 1: sig = sig[None]
 		loc   = jnp.asarray(loc, dtype=jnp.float64)
@@ -2093,7 +2129,7 @@ def _synthesis(alm, npix, spins, mode, args, kind, xp, out=None, nthread=None, g
 	"""Synthesis from alm [...,nalm,nelem] to a flat pixel buffer [...,ncomp,npix]"""
 	func = _sht_func(kind, general, False)
 	if kind == "jax":
-		return func(alm, spin=spins, mode=mode, **args)
+		return func(alm, spin=spins, mode=mode, nthreads=_nthread(nthread), **args)
 	if out is None:
 		out = xp.empty(alm.shape[:-2]+(_sht_ffi_ncomp(spins,mode)[0],npix),
 			utils.real_dtype(alm.dtype))
@@ -2110,7 +2146,7 @@ def _adjoint(buf, ainfo, spins, mode, args, kind, xp, nthread=None, general=Fals
 	"""Adjoint synthesis from a flat pixel buffer [...,ncomp,npix] to alm"""
 	func = _sht_func(kind, general, True)
 	if kind == "jax":
-		return func(buf, spin=spins, mode=mode, **args)
+		return func(buf, spin=spins, mode=mode, nthreads=_nthread(nthread), **args)
 	nalm = 1 if mode != "STANDARD" else buf.shape[-2]
 	out  = xp.empty(buf.shape[:-2]+(nalm,ainfo.nelem), utils.complex_dtype(buf.dtype))
 	def call(m, a, s):
