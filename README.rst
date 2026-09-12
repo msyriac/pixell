@@ -112,9 +112,10 @@ Building for CPU and GPU
 
 ``curvedsky.alm2map``, ``curvedsky.map2alm`` and ``curvedsky.alm2map_pos`` accept CuPy and JAX
 arrays as well as numpy arrays, and run on the device that holds their input, so the same code
-runs on a CPU and a GPU. Numpy arrays always use the CPU code. The device path needs ``ducc0``
-built with its CUDA backend from the ``cuda-sht`` branch of https://github.com/msyriac/ducc; the
-``ducc0`` wheel on PyPI runs on the CPU only.
+runs on a CPU and a GPU. Numpy arrays always use the CPU code. Both paths need ``ducc0`` from the
+``cuda-sht`` branch of https://github.com/msyriac/ducc rather than the wheel on PyPI: a GPU needs
+its CUDA backend, and JAX needs the XLA handlers, which that branch exports for the ordinary CPU
+transforms as well.
 
 On a machine with the CUDA toolkit (``nvcc``, with a host compiler it supports), in the
 environment pixell will be used from:
@@ -136,13 +137,18 @@ call the transforms inside ``jax.jit``, so jax must be installed before ducc; le
 skip jax, if only CuPy arrays are used. CuPy is likewise only needed for CuPy arrays.
 
 To check the build, ``python -c "import ducc0; print(ducc0.sht.cuda_emulated, hasattr(ducc0.sht,
-'sht_ffi_targets'))"`` should print ``False True``, and ``pytest tests/test_curvedsky_device.py``
-runs the device tests. ``pytest tests/test_device_benchmark.py`` then times ``alm2map`` and
-``map2alm`` on the CPU and, through CuPy and JAX, on the GPU, checks that the results agree, and
-prints a table of the timings (``PIXELL_BENCH_LMAX`` sets the band limit, default 1000). On a
-machine without a GPU, ``DUCC0_CUDA_EMULATE=1`` in place of ``DUCC0_USE_CUDA=1`` and
-``DUCC0_CUDA_ARCH`` (no ``nvcc`` needed) builds the same code for the CPU, so that the JAX path can
-be tested there; it is much slower than the numpy path.
+'sht_ffi_targets'), hasattr(ducc0.sht, 'sht_ffi_cpu_targets'))"`` should print ``False True True``,
+and ``pytest tests/test_curvedsky_device.py`` runs the device tests. ``pytest
+tests/test_device_benchmark.py`` then times ``alm2map`` and ``map2alm`` on the CPU and, through
+CuPy and JAX, on the GPU, checks that the results agree, and prints a table of the timings
+(``PIXELL_BENCH_LMAX`` sets the band limit, default 1000).
+
+On a machine without a GPU, leave out ``DUCC0_USE_CUDA=1`` and ``DUCC0_CUDA_ARCH`` and keep
+``DUCC0_XLA_INCLUDE``; no ``nvcc`` is then needed. JAX arrays run on ducc's ordinary CPU transforms
+through the same handlers, at the speed of the numpy path, and only CuPy is unavailable.
+``DUCC0_CUDA_EMULATE=1`` instead compiles the GPU kernels for the host, which is meant for testing
+the device code without a GPU: it is far slower than either path, and pixell uses it only when
+``PIXELL_ALLOW_CPU_JAX=1`` asks it to.
 
 Contributions
 -------------
