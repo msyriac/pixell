@@ -555,3 +555,58 @@ def test_offset_by_grad_zero_deflection_at_a_pole(geodesic):
         assert_allclose(out[2,i], 0.0, atol=0)
     # the device path shares the trigonometry and must agree exactly
     assert_allclose(lensing._offset_by_grad_device(ipos, grad, 3, geodesic), out, atol=0)
+
+
+def device_module(kind):
+    """The numpy-like module for kind ("jax" or "cupy"), or skip the test. These
+    functions are plain array operations, so they need no ducc handlers."""
+    if kind == "jax":
+        jax = pytest.importorskip("jax")
+        jax.config.update("jax_enable_x64", True)
+        return jax.numpy
+    cp = pytest.importorskip("cupy")
+    try:
+        cp.zeros(1)
+    except Exception:
+        pytest.skip("cupy has no usable device")
+    return cp
+
+
+def host(arr):
+    return arr.get() if hasattr(arr, "get") else np.asarray(arr)
+
+
+@pmp("kind", ["jax", "cupy"])
+def test_device_almxfl_matches_numpy(kind):
+    """almxfl on a device: scalar, short, callable, broadcast and matrix filters"""
+    xp    = device_module(kind)
+    ainfo = curvedsky.alm_info(60)
+    alm   = random_alm(ainfo, 3)
+    dev   = xp.asarray(alm)
+    rng   = np.random.default_rng(4)
+    for lfilter in [rng.normal(size=61), rng.normal(size=30), lambda l: 1/(1+l**2),
+            rng.normal(size=(3,61)), rng.normal(size=(2,3,61))]:
+        ref = curvedsky.almxfl(alm, lfilter)
+        got = host(curvedsky.almxfl(dev, lfilter))
+        assert_allclose(got, ref, rtol=1e-12, atol=1e-14)
+    got = host(curvedsky.almxfl(dev[0], np.ones(61)))
+    assert_allclose(got, alm[0], rtol=1e-15)
+
+
+@pmp("kind", ["jax", "cupy"])
+def test_device_alm2cl_matches_numpy(kind):
+    """alm2cl on a device: auto and cross spectra, broadcasting and dtype"""
+    xp    = device_module(kind)
+    ainfo = curvedsky.alm_info(60)
+    a, b  = random_alm(ainfo, 3, seed=1), random_alm(ainfo, 3, seed=2)
+    da, db = xp.asarray(a), xp.asarray(b)
+    for args, dargs in [((a[0],), (da[0],)), ((a[0], b[0]), (da[0], db[0])),
+            ((a[:,None], a[None]), (da[:,None], da[None])), ((a, b[1]), (da, db[1]))]:
+        ref = curvedsky.alm2cl(*args)
+        got = curvedsky.alm2cl(*dargs)
+        assert curvedsky.array_module(got)[0] == kind
+        assert_allclose(host(got), ref, rtol=1e-12, atol=1e-14*np.abs(ref).max())
+    a32 = a[0].astype(np.complex64)
+    got = curvedsky.alm2cl(xp.asarray(a32), dtype=np.float64)
+    assert host(got).dtype == np.float64
+    assert_allclose(host(got), curvedsky.alm2cl(a32, dtype=np.float64), rtol=1e-6)

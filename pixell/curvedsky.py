@@ -697,7 +697,12 @@ def almxfl(alm,lfilter=None,ainfo=None,out=None):
 
 	Returns:
 	    falm: The filtered alms a_{l,m} * lfilter(l)
+
+	Alms on a device, as CuPy or JAX arrays, are filtered there and returned in
+	the same array library. JAX arrays cannot be written into, so out must be
+	None for them.
 	"""
+	if is_device_array(alm): return _device_almxfl(alm, lfilter, ainfo=ainfo, out=out)
 	alm   = np.asarray(alm)
 	ainfo = alm_info(nalm=alm.shape[-1]) if ainfo is None else ainfo
 	if callable(lfilter):
@@ -761,7 +766,12 @@ def alm2cl(alm, alm2=None, ainfo=None, dtype=None):
 
 	3. Passing dtype=np.float32 will return an error if the alms are double. There
 	is no difference vs. dtype=None if the alms are already single-precision.
+
+	Alms on a device, as CuPy or JAX arrays, give the spectrum on that device, in
+	the same array library.
 	"""
+	if is_device_array(alm) or is_device_array(alm2):
+		return _device_alm2cl(alm, alm2=alm2, ainfo=ainfo, dtype=dtype)
 	alm = np.asarray(alm)
 	ainfo = alm_info(nalm=alm.shape[-1]) if ainfo is None else ainfo
 	return ainfo.alm2cl(alm, alm2=alm2, dtype=dtype)
@@ -1949,6 +1959,58 @@ def array_module(arr):
 		import cupy
 		return "cupy", cupy
 	return "numpy", np
+
+_alm_layout_cache = {}
+def alm_layout(ainfo, xp=np, cache=4):
+	"""The multipole of each element of an alm array with the layout ainfo, and
+	the weight of each element in a sum over all m of a real field (1 for m=0,
+	2 for m>0, 0 for elements the layout does not use), as arrays of the
+	numpy-like module xp. Built once per layout and array library, since the
+	device versions of almxfl and alm2cl index with them on every call."""
+	key = (ainfo.lmax, ainfo.mmax, ainfo.stride, np.asarray(ainfo.mstart).tobytes(), xp.__name__)
+	if key not in _alm_layout_cache:
+		if len(_alm_layout_cache) >= cache: _alm_layout_cache.pop(next(iter(_alm_layout_cache)))
+		ell    = np.zeros(ainfo.nelem, np.int64)
+		weight = np.zeros(ainfo.nelem, np.float64)
+		for m in range(ainfo.mmax+1):
+			l = np.arange(m, ainfo.lmax+1)
+			i = ainfo.lm2ind(l, m)
+			ell[i], weight[i] = l, (1 if m == 0 else 2)
+		_alm_layout_cache[key] = (xp.asarray(ell), xp.asarray(weight))
+	return _alm_layout_cache[key]
+
+def _device_almxfl(alm, lfilter, ainfo=None, out=None):
+	"""almxfl for alms that may live on a GPU. Called by almxfl; see its
+	docstring. Multipoles beyond the end of lfilter are zeroed, and a filter of
+	shape [a,b,nl] applied to alms of shape [b,nalm] is a matrix product, as for
+	numpy arrays."""
+	kind, xp = array_module(alm)
+	ainfo = alm_info(nalm=alm.shape[-1]) if ainfo is None else ainfo
+	if callable(lfilter): lfilter = lfilter(np.arange(ainfo.lmax+1.0))
+	lfilter = np.asarray(lfilter)
+	filt  = np.zeros(lfilter.shape[:-1]+(ainfo.lmax+1,), utils.real_dtype(alm.dtype))
+	n     = min(lfilter.shape[-1], ainfo.lmax+1)
+	filt[...,:n] = lfilter[...,:n]
+	flm   = xp.asarray(filt)[...,alm_layout(ainfo, xp)[0]]
+	res   = xp.einsum("abi,bi->ai", flm, alm) if flm.ndim == 3 and alm.ndim == 2 else alm*flm
+	return _store(res, out)
+
+def _device_alm2cl(alm, alm2=None, ainfo=None, dtype=None):
+	"""alm2cl for alms that may live on a GPU. Called by alm2cl; see its
+	docstring. The arrays broadcast over their leading dimensions."""
+	kind, xp = array_module(alm if is_device_array(alm) else alm2)
+	alm   = xp.asarray(alm)
+	alm2  = alm if alm2 is None else xp.asarray(alm2)
+	ainfo = alm_info(nalm=alm.shape[-1]) if ainfo is None else ainfo
+	ell, weight = alm_layout(ainfo, xp)
+	rtype = utils.real_dtype(np.result_type(alm.dtype, alm2.dtype)) if dtype is None else dtype
+	alm, alm2 = xp.broadcast_arrays(alm, alm2)
+	pre   = alm.shape[:-1]
+	x     = (weight*xp.real(alm*xp.conj(alm2))).astype(rtype).reshape(-1, alm.shape[-1])
+	nl    = ainfo.lmax+1
+	kw    = {"length": nl} if kind == "jax" else {"minlength": nl}
+	cl    = xp.stack([xp.bincount(ell, weights=row, **kw) for row in x])
+	return (cl/xp.asarray(2*np.arange(nl)+1.0, dtype=rtype)).astype(rtype).reshape(pre+(nl,))
 
 def _device_alm2map(alm, map=None, spin=[0,2], deriv=False, adjoint=False, copy=False,
 		ainfo=None, lmax=None, mmax=None, nthread=None, pix_tol=1e-6, method="auto"):
